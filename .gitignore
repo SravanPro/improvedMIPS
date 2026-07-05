@@ -1,0 +1,22 @@
+# Vivado
+*.jou
+*.log
+*.str
+
+.cache/
+.hw/
+.ip_user_files/
+.sim/
+.Xil/
+
+*.runs/
+*.gen/
+*.tmp/
+
+*.dcp
+*.bit
+*.bin
+
+# Python
+.venv/
+__pycache__/

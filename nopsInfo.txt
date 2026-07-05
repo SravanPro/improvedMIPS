@@ -1,0 +1,21 @@
+From the code analysis:
+
+JR: 
+    3 NOPs before whenever any of the preceding 3 instructions write to JR's source register. 
+
+    Reason: JR is resolved in the ID stage using `id_rd1` directly from the register file output. 
+    There is no forwarding path into this read, the forwarding unit only muxes into the EX stage. 
+    So a result still in EX, MEM, or WB when JR is in ID won't reach it.
+
+beq/bne:
+    2 NOPs minimum (3 to be safe) before, whenever any preceding instruction writes a register the branch reads. 
+    
+    Reason: branches resolve in MEM using the EX-stage ALU zero flag. 
+    Forwarding covers most cases, but `lw` directly before a branch is a hard failure — 
+    the HDU stalls one cycle, but the load data still isn't available when the branch reaches EX. The forwarding unit doesn't have a path for that case.
+
+j/jal:
+    no NOPs needed. The jump target is purely instruction encoded. 
+    no register is read. The flush signal (`id_jump | id_jal`) squashes the one spuriously fetched instruction automatically.
+
+rule is: 3 NOPs before `jr`, `beq`, `bneq`, nothing needed before `j`/`jal`.

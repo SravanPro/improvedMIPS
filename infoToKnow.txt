@@ -1,0 +1,11 @@
+1. assembler: assembles asm code into binary for imem
+    copy your assembly code into the input.txt of the pyFiles folder
+    in the directory 
+        C:\Vivado\CompArch\improvedMipsGit\improvedMIPS\pyFiles
+    run: 
+        python asm.py input.txt output.txt
+    you'll get result in output.txt, paste in instruction memory.
+
+2. compressor: copies the contents of all the modules in the folder
+
+
