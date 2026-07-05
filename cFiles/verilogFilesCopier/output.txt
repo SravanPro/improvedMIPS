@@ -38,9 +38,14 @@ module alu(
             4'b0100: result = ~(a & b);
             4'b1000: result = ~(a | b);
             4'b1001: result = a ^ b;
-            4'b1010: result = a << b[4:0];
-            4'b1011: result = a >> b[4:0];
-            4'b1100: result = $signed(a) >>> b[4:0];
+            
+            
+                        
+            4'b1010: result = b << a[4:0];
+            4'b1011: result = b >> a[4:0];
+            4'b1100: result = $signed(b) >>> a[4:0];
+            
+            
             4'b1101: result = a + 32'd1;
             4'b1110: result = a - 32'd1;
             4'b1111: result = (a == b) ? 32'd1 : 32'd0;
@@ -1971,27 +1976,36 @@ module memory #(parameter memorySizeInBytes = 3000, parameter ioWidth = 256)
         // ---- Arena end (0x0733). Ray lengths/heights initialized to 0 by loop above. ----
     end
 
-    // ---- combinational read ----
-    always @(*) begin
-        if (memRead) begin
+    // ---- synchronous (registered) read ----
+    // Was combinational (`always @(*)`), which no BRAM primitive can implement natively
+    // (every real block-RAM read port samples the address on a clock edge and returns
+    // data after that edge). Now the address is sampled at posedge clock, one cycle of
+    // latency, matching genuine BRAM timing. The pipeline compensates for this extra
+    // cycle with a dedicated one-cycle DMEM stall (see pipeline.v: dmem_wait/dmem_stall),
+    // which freezes the whole pipeline for one cycle on every load so the now-registered
+    // readData lands in mem_wb correctly paired with the rest of the load's control info.
+    always @(posedge clock or posedge reset) begin
+        if (reset) begin
+            readData <= 32'b0;
+        end else if (memRead) begin
             if (address[31:8] != 24'hFFFFFF) begin
-                readData = {mem[address], mem[address+1], mem[address+2], mem[address+3]};
+                readData <= {mem[address], mem[address+1], mem[address+2], mem[address+3]};
             end else begin
                 if (address[7:0] < ioWidth)
-                    readData = {32{memMappedIO[address[7:0]]}};
+                    readData <= {32{memMappedIO[address[7:0]]}};
                 else
-                    readData = 32'b0;
+                    readData <= 32'b0;
             end
         end else begin
-            readData = 32'b0;
+            readData <= 32'b0;
         end
     end
 
     // ---- synchronous write ----
     always @(posedge clock or posedge reset) begin
         if (reset) begin
-            for (i = 0; i < memorySizeInBytes; i = i + 1)
-                mem[i] <= 8'h00;
+            // for (i = 0; i < memorySizeInBytes; i = i + 1)
+            //     mem[i] <= 8'h00;
         end
         else begin
             if (memWrite && address[31:8] != 24'hFFFFFF) begin
@@ -2584,12 +2598,31 @@ module pipeline #(parameter inputs = 256)(
     wire        fxpu_stall_all;
     wire        fxpu_stall_id;
 
+    // ---- DMEM synchronous-read stall ----
+    // DMEM's read port is now registered (see memory.v), i.e. one cycle of latency
+    // between presenting an address and the data being valid. dmem_wait tracks whether
+    // we've already spent that one required wait-cycle for the load currently sitting
+    // in ex_mem: dmem_stall fires exactly once per load (the cycle it first arrives in
+    // ex_mem), freezing the whole pipeline (pc, if_id, id_ex, ex_mem, mem_wb) for that
+    // one cycle so the address stays stable across the clock edge that latches DMEM's
+    // registered read, then releases the next cycle so mem_wb can capture the now-valid
+    // readData paired with the load's still-held control info in ex_mem.
+    wire        ex_mem_MemRead, ex_mem_MemWrite, ex_mem_RegWrite, ex_mem_MemToReg, ex_mem_Jal;
+
+    reg  dmem_wait;
+    wire dmem_stall = ex_mem_MemRead & ~dmem_wait;
+
+    always @(posedge clock or posedge reset) begin
+        if (reset) dmem_wait <= 1'b0;
+        else       dmem_wait <= dmem_stall;
+    end
+
     wire id_isMul = (id_opcode == 6'b000000) && (id_funct == 6'b011000);
     wire id_isDiv = (id_opcode == 6'b000000) && (id_funct == 6'b011010);
 
     pc PC (
         .clock(clock), .reset(reset),
-        .pcStall(~hdu_PCWrite | fxpu_stall_id),
+        .pcStall(~hdu_PCWrite | fxpu_stall_id | dmem_stall),
         .pcInVal(pc_next), .pcOutVal(pc_out)
     );
     adder PC_ADDER (.a(pc_out), .b(32'd4), .sum(pc_plus4));
@@ -2597,7 +2630,7 @@ module pipeline #(parameter inputs = 256)(
 
     if_id IF_ID (
         .clock(clock), .reset(reset),
-        .if_id_stall(~hdu_IF_IDWrite | fxpu_stall_id),
+        .if_id_stall(~hdu_IF_IDWrite | fxpu_stall_id | dmem_stall),
         .if_id_flush(id_jump | id_jal | id_jr | mem_PCSrc),
         .if_id_NPC_in(pc_plus4),   .if_id_IR_in(if_instruction),
         .if_id_NPC_out(if_id_NPC), .if_id_IR_out(if_id_IR)
@@ -2664,7 +2697,7 @@ module pipeline #(parameter inputs = 256)(
 
     id_ex ID_EX (
         .clock(clock), .reset(reset),
-        .id_ex_flush(mem_PCSrc | hdu_ID_EXStall), .id_ex_stall(fxpu_stall_id),
+        .id_ex_flush(mem_PCSrc | hdu_ID_EXStall), .id_ex_stall(fxpu_stall_id | dmem_stall),
         .id_ex_NPC_in(if_id_NPC),
         .id_ex_A_in(id_rd1),     .id_ex_B_in(id_rd2),
         .id_ex_Imm_in(id_imm),
@@ -2692,7 +2725,6 @@ module pipeline #(parameter inputs = 256)(
     wire [31:0] ex_mem_NPC, ex_mem_BranchTarget, ex_mem_AluOut, ex_mem_B;
     wire [4:0]  ex_mem_RD;
     wire        ex_mem_Zero, ex_mem_BranchEq, ex_mem_BranchNe;
-    wire        ex_mem_MemRead, ex_mem_MemWrite, ex_mem_RegWrite, ex_mem_MemToReg, ex_mem_Jal;
     wire [1:0]  forwardA, forwardB;
     wire [31:0] forwardMuxA_out, forwardMuxB_out;
 
@@ -2762,7 +2794,7 @@ module pipeline #(parameter inputs = 256)(
     adder BRANCH_ADDER (.a(id_ex_NPC), .b(ex_shiftedImm), .sum(ex_branchTarget));
 
     ex_mem EX_MEM (
-        .clock(clock), .reset(reset), .ex_mem_flush(mem_PCSrc), .ex_mem_stall(fxpu_stall_all),
+        .clock(clock), .reset(reset), .ex_mem_flush(mem_PCSrc), .ex_mem_stall(fxpu_stall_all | dmem_stall),
         .ex_mem_NPC_in(id_ex_NPC),
         .ex_mem_BranchTarget_in(ex_branchTarget), .ex_mem_Zero_in(ex_zero),
         .ex_mem_AluOut_in(ex_aluResult_final),     .ex_mem_B_in(forwardMuxB_out),
@@ -2796,7 +2828,7 @@ module pipeline #(parameter inputs = 256)(
     );
 
     mem_wb MEM_WB (
-        .clock(clock), .reset(reset), .mem_wb_stall(fxpu_stall_all),
+        .clock(clock), .reset(reset), .mem_wb_stall(fxpu_stall_all | dmem_stall),
         .mem_wb_NPC_in(ex_mem_NPC),
         .mem_wb_LMD_in(mem_readData),      .mem_wb_AluOut_in(ex_mem_AluOut),
         .mem_wb_RD_in(ex_mem_RD),
@@ -3512,9 +3544,12 @@ endmodule
 `timescale 1ns / 1ps
 
 module TB1 ();
+
     reg clock, reset;
 
     reg white, black, brown, red, gameRst, erase, draw;
+
+    integer outfile;
 
     parent uut(
         .clock(clock),
@@ -3530,6 +3565,142 @@ module TB1 ();
 
     always #5 clock = ~clock;
 
+    task dumpColumnHeights;
+    begin
+        outfile = $fopen("column_heights.txt", "w");
+
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h0);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h1);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h2);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h3);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h4);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h5);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h6);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h7);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h8);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h9);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h10);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h11);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h12);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h13);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h14);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h15);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h16);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h17);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h18);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h19);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h20);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h21);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h22);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h23);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h24);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h25);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h26);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h27);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h28);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h29);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h30);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h31);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h32);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h33);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h34);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h35);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h36);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h37);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h38);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h39);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h40);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h41);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h42);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h43);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h44);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h45);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h46);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h47);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h48);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h49);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h50);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h51);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h52);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h53);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h54);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h55);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h56);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h57);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h58);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h59);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h60);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h61);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h62);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h63);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h64);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h65);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h66);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h67);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h68);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h69);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h70);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h71);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h72);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h73);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h74);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h75);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h76);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h77);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h78);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h79);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h80);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h81);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h82);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h83);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h84);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h85);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h86);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h87);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h88);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h89);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h90);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h91);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h92);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h93);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h94);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h95);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h96);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h97);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h98);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h99);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h100);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h101);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h102);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h103);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h104);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h105);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h106);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h107);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h108);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h109);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h110);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h111);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h112);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h113);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h114);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h115);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h116);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h117);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h118);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h119);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h120);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h121);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h122);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h123);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h124);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h125);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h126);
+        $fdisplay(outfile, "%0d", uut.RAYCAST_RENDERER.h127);
+        $fclose(outfile);
+    end
+    endtask
+
     initial begin
         clock = 0;
         reset = 1;
@@ -3544,7 +3715,11 @@ module TB1 ();
 
         #300 reset = 0;
 
-        #1000000;
+        // Snapshot exactly at t = 1 ms
+        #999700;
+        dumpColumnHeights();
+
+        // Original delays (unchanged)
         #2385000;
         #10000;
 
