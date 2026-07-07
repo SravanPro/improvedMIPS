@@ -1976,28 +1976,19 @@ module memory #(parameter memorySizeInBytes = 3000, parameter ioWidth = 256)
         // ---- Arena end (0x0733). Ray lengths/heights initialized to 0 by loop above. ----
     end
 
-    // ---- synchronous (registered) read ----
-    // Was combinational (`always @(*)`), which no BRAM primitive can implement natively
-    // (every real block-RAM read port samples the address on a clock edge and returns
-    // data after that edge). Now the address is sampled at posedge clock, one cycle of
-    // latency, matching genuine BRAM timing. The pipeline compensates for this extra
-    // cycle with a dedicated one-cycle DMEM stall (see pipeline.v: dmem_wait/dmem_stall),
-    // which freezes the whole pipeline for one cycle on every load so the now-registered
-    // readData lands in mem_wb correctly paired with the rest of the load's control info.
-    always @(posedge clock or posedge reset) begin
-        if (reset) begin
-            readData <= 32'b0;
-        end else if (memRead) begin
+    // ---- combinational read ----
+    always @(*) begin
+        if (memRead) begin
             if (address[31:8] != 24'hFFFFFF) begin
-                readData <= {mem[address], mem[address+1], mem[address+2], mem[address+3]};
+                readData = {mem[address], mem[address+1], mem[address+2], mem[address+3]};
             end else begin
                 if (address[7:0] < ioWidth)
-                    readData <= {32{memMappedIO[address[7:0]]}};
+                    readData = {32{memMappedIO[address[7:0]]}};
                 else
-                    readData <= 32'b0;
+                    readData = 32'b0;
             end
         end else begin
-            readData <= 32'b0;
+            readData = 32'b0;
         end
     end
 
@@ -2598,31 +2589,12 @@ module pipeline #(parameter inputs = 256)(
     wire        fxpu_stall_all;
     wire        fxpu_stall_id;
 
-    // ---- DMEM synchronous-read stall ----
-    // DMEM's read port is now registered (see memory.v), i.e. one cycle of latency
-    // between presenting an address and the data being valid. dmem_wait tracks whether
-    // we've already spent that one required wait-cycle for the load currently sitting
-    // in ex_mem: dmem_stall fires exactly once per load (the cycle it first arrives in
-    // ex_mem), freezing the whole pipeline (pc, if_id, id_ex, ex_mem, mem_wb) for that
-    // one cycle so the address stays stable across the clock edge that latches DMEM's
-    // registered read, then releases the next cycle so mem_wb can capture the now-valid
-    // readData paired with the load's still-held control info in ex_mem.
-    wire        ex_mem_MemRead, ex_mem_MemWrite, ex_mem_RegWrite, ex_mem_MemToReg, ex_mem_Jal;
-
-    reg  dmem_wait;
-    wire dmem_stall = ex_mem_MemRead & ~dmem_wait;
-
-    always @(posedge clock or posedge reset) begin
-        if (reset) dmem_wait <= 1'b0;
-        else       dmem_wait <= dmem_stall;
-    end
-
     wire id_isMul = (id_opcode == 6'b000000) && (id_funct == 6'b011000);
     wire id_isDiv = (id_opcode == 6'b000000) && (id_funct == 6'b011010);
 
     pc PC (
         .clock(clock), .reset(reset),
-        .pcStall(~hdu_PCWrite | fxpu_stall_id | dmem_stall),
+        .pcStall(~hdu_PCWrite | fxpu_stall_id),
         .pcInVal(pc_next), .pcOutVal(pc_out)
     );
     adder PC_ADDER (.a(pc_out), .b(32'd4), .sum(pc_plus4));
@@ -2630,7 +2602,7 @@ module pipeline #(parameter inputs = 256)(
 
     if_id IF_ID (
         .clock(clock), .reset(reset),
-        .if_id_stall(~hdu_IF_IDWrite | fxpu_stall_id | dmem_stall),
+        .if_id_stall(~hdu_IF_IDWrite | fxpu_stall_id),
         .if_id_flush(id_jump | id_jal | id_jr | mem_PCSrc),
         .if_id_NPC_in(pc_plus4),   .if_id_IR_in(if_instruction),
         .if_id_NPC_out(if_id_NPC), .if_id_IR_out(if_id_IR)
@@ -2697,7 +2669,7 @@ module pipeline #(parameter inputs = 256)(
 
     id_ex ID_EX (
         .clock(clock), .reset(reset),
-        .id_ex_flush(mem_PCSrc | hdu_ID_EXStall), .id_ex_stall(fxpu_stall_id | dmem_stall),
+        .id_ex_flush(mem_PCSrc | hdu_ID_EXStall), .id_ex_stall(fxpu_stall_id),
         .id_ex_NPC_in(if_id_NPC),
         .id_ex_A_in(id_rd1),     .id_ex_B_in(id_rd2),
         .id_ex_Imm_in(id_imm),
@@ -2725,6 +2697,7 @@ module pipeline #(parameter inputs = 256)(
     wire [31:0] ex_mem_NPC, ex_mem_BranchTarget, ex_mem_AluOut, ex_mem_B;
     wire [4:0]  ex_mem_RD;
     wire        ex_mem_Zero, ex_mem_BranchEq, ex_mem_BranchNe;
+    wire        ex_mem_MemRead, ex_mem_MemWrite, ex_mem_RegWrite, ex_mem_MemToReg, ex_mem_Jal;
     wire [1:0]  forwardA, forwardB;
     wire [31:0] forwardMuxA_out, forwardMuxB_out;
 
@@ -2794,7 +2767,7 @@ module pipeline #(parameter inputs = 256)(
     adder BRANCH_ADDER (.a(id_ex_NPC), .b(ex_shiftedImm), .sum(ex_branchTarget));
 
     ex_mem EX_MEM (
-        .clock(clock), .reset(reset), .ex_mem_flush(mem_PCSrc), .ex_mem_stall(fxpu_stall_all | dmem_stall),
+        .clock(clock), .reset(reset), .ex_mem_flush(mem_PCSrc), .ex_mem_stall(fxpu_stall_all),
         .ex_mem_NPC_in(id_ex_NPC),
         .ex_mem_BranchTarget_in(ex_branchTarget), .ex_mem_Zero_in(ex_zero),
         .ex_mem_AluOut_in(ex_aluResult_final),     .ex_mem_B_in(forwardMuxB_out),
@@ -2828,7 +2801,7 @@ module pipeline #(parameter inputs = 256)(
     );
 
     mem_wb MEM_WB (
-        .clock(clock), .reset(reset), .mem_wb_stall(fxpu_stall_all | dmem_stall),
+        .clock(clock), .reset(reset), .mem_wb_stall(fxpu_stall_all),
         .mem_wb_NPC_in(ex_mem_NPC),
         .mem_wb_LMD_in(mem_readData),      .mem_wb_AluOut_in(ex_mem_AluOut),
         .mem_wb_RD_in(ex_mem_RD),
