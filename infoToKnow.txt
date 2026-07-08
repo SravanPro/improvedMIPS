@@ -6,6 +6,5 @@
         python asm.py input.txt output.txt
     you'll get result in output.txt, paste in instruction memory.
 
-2. compressor: copies the contents of all the modules in the folder
-
+2. compressor: copies the contents of all the modules in the folder, not needed now.
 

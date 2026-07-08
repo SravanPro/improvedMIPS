@@ -1,0 +1,17 @@
+workflow:
+how to assemlbe:
+    1. write asm code in asmcode.asm
+    2. paste it into input.txt of pyFiles folder
+    3. run it, paste output content into instruction mem's bin
+
+how does my pipeline processor look like?
+    refer to pipeline_design_report.md
+how does my raycaster logic work?
+    refer to raycaster_design_spec.md
+
+how many nops does my code need?
+    refer to infotoKnow.txt
+
+source files: C:\misc\improvedMIPS\improvedMIPS.srcs\sources_1\new
+TB files: C:\misc\improvedMIPS\improvedMIPS.srcs\sim_1\new
+

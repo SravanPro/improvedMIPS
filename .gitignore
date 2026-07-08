@@ -17,6 +17,14 @@
 *.bit
 *.bin
 
+*.vcd
+*.vvp
+*.wdb
+*.exe
+
+improvedMIPS.sim/
+improvedMIPS.runs/
+xsim.dir/
 # Python
 .venv/
 __pycache__/

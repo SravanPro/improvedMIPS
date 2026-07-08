@@ -1,15 +1,14 @@
 `timescale 1ns / 1ps
 
-// memorySizeInBytes increased to 3000 to accommodate:
-//   1444 B  Sine LUT
-//    400 B  Arena map (word-packed, 100*4)
-//    512 B  Ray lengths (128*4, FP 24.8)
-//    512 B  Column heights (128*4, integer)
-//     16 B  DDA scratch (4 words)
-//    116 B  padding
-// = 3000 B total
+// DMEM layout (compact, no gaps):
+//   1444 B  Sine LUT        (0x0000-0x05A3, 361×4, FP 24.8)
+//    400 B  Arena map       (0x05A4-0x0733, 100×4, word-packed)
+//    512 B  Column heights  (0x0734-0x0933, 128×4, integer)
+//     16 B  DDA scratch     (0x0934-0x0943, 4 words)
+//      4 B  $31 spill       (0x0944-0x0947)
+// = 2376 B total
 
-module memory #(parameter memorySizeInBytes = 3000, parameter ioWidth = 256)
+module memory #(parameter memorySizeInBytes = 2376, parameter ioWidth = 256)
 (
     input  wire        clock, reset,
     input  wire        memWrite, memRead,

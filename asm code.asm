@@ -1,13 +1,12 @@
-# DDA Raycaster — MIPS Assembly (final, corrected, $31 spill fix)
+# DDA Raycaster — MIPS Assembly (final, corrected: $31 spill + div-by-zero guard)
 # Fixed-point format: 24.8 throughout.
 #
 # DMEM layout:
 #   0x0000 - 0x05A3 : Sine LUT         (1444 bytes, 361 * 4)
 #   0x05A4 - 0x0733 : Arena map        ( 400 bytes, 100 * 4, word-packed: value in LSB)
-#   0x0734 - 0x0933 : Ray lengths      ( 512 bytes, 128 * 4, FP 24.8)
-#   0x0934 - 0x0B33 : Column heights   ( 512 bytes, 128 * 4, integer)
-#   0x0B34 - 0x0B43 : DDA scratch      (  16 bytes, 4 words)
-#   0x0B44          : raycaster $31 spill (4 bytes, free padding word)
+#   0x0734 - 0x0933 : Column heights   ( 512 bytes, 128 * 4, integer)
+#   0x0934 - 0x0943 : DDA scratch      (  16 bytes, 4 words)
+#   0x0944          : raycaster $31 spill (4 bytes)
 #
 # Arena: 10x10 grid (row 0 = north/top, row 9 = south/bottom)
 #   Byte value 1 = wall, 0 = empty.
@@ -17,12 +16,12 @@
 # map_y_from_bottom = floor((y_fp + 1280) / 256)  [0=south, 9=north]
 # map_x             = floor((x_fp + 1280) / 256)  [0=west,  9=east]
 #
-# Scratch layout (base 0x0B34 = 2868):
-#   [0x0B34] delta_dist_x (FP 24.8)
-#   [0x0B38] delta_dist_y (FP 24.8)
-#   [0x0B3C] step_x       (+1 = east, -1 = west)
-#   [0x0B40] step_map_y   (+1 = north, -1 = south)
-#   [0x0B44] raycaster's own return address ($31 spill, since it calls
+# Scratch layout (base 0x0934 = 2356):
+#   [0x0934] delta_dist_x (FP 24.8)
+#   [0x0938] delta_dist_y (FP 24.8)
+#   [0x093C] step_x       (+1 = east, -1 = west)
+#   [0x0940] step_map_y   (+1 = north, -1 = south)
+#   [0x0944] raycaster's own return address ($31 spill, since it calls
 #            jal cos / jal sin internally which would otherwise clobber $31)
 #
 # FOV: 128 deg, 128 rays, 1 deg/ray.
@@ -33,6 +32,11 @@
 #             div uses f=8 (same).
 #   mul rd, rs, rt  -> rd = (rs * rt) >> 8   (FP 24.8 × FP 24.8 -> FP 24.8)
 #   div rd, rs, rt  -> rd = (rs << 8) / rt   (FP result; see math comments)
+#   Div by zero returns 0xFFFFFFFF, which as SIGNED is -1 -- this corrupts
+#   any signed comparison against side_dist. Ray direction components are
+#   therefore clamped to a minimum magnitude of 1 before being used as a
+#   divisor, to guarantee no exact-zero divide (hit at cardinal angles,
+#   e.g. exactly 270 deg where cos=0).
 #
 # K=32: column height = (K<<8) / ray_len_fp = 8192 / ray_len_fp  (integer result)
 #   At ray_len=0.5 units (FP=128): h = 8192/128 = 64 (full screen)
@@ -190,19 +194,16 @@ jr    $31
 
 ########################################
 # raycaster: casts 128 rays.
-# Writes FP ray lengths to [RAYLEN_BASE + i*4]
-# Writes integer heights  to [CHEIGHT_BASE + i*4]
+# Writes integer heights to [CHEIGHT_BASE + i*4]
 ########################################
 raycaster:
-sw    $31, 0x0B44($0)       # spill raycaster's own return address (jal cos/sin below will clobber $31)
+sw    $31, 0x0944($0)       # spill raycaster's own return address (jal cos/sin below will clobber $31)
 
 # Load base addresses and K constant
 lui   $14, 0x0000
 ori   $14, $14, 0x05A4      # ARENA_BASE  = 1444 = 0x05A4
-lui   $15, 0x0000
-ori   $15, $15, 0x0734      # RAYLEN_BASE = 1844 = 0x0734
 lui   $16, 0x0000
-ori   $16, $16, 0x0934      # CHEIGHT_BASE= 2356 = 0x0934
+ori   $16, $16, 0x0734      # CHEIGHT_BASE= 1844 = 0x0734
 addi  $17, $0, 32           # K = 32 (real int; FXPU div yields (32<<8)/ray_len = 8192/ray_len)
 
 # Start angle = theta - 64 degrees (in FP: theta - 64*256 = theta - 16384)
@@ -267,7 +268,7 @@ bne   $28, $0, xDirNeg
 
 # ray_dir_x >= 0 (eastward)
 addi  $29, $0, 1
-sw    $29, 0x0B3C($0)       # step_x = +1
+sw    $29, 0x093C($0)       # step_x = +1
 addi  $28, $1, 1280
 andi  $28, $28, 0x00FF      # sub-cell x position [0..255]
 sub   $28, $11, $28         # frac_x = 256 - pos = dist to east boundary (FP frac)
@@ -276,11 +277,19 @@ j     doneStepX
 xDirNeg:
 # ray_dir_x < 0 (westward)
 addi  $29, $0, -1
-sw    $29, 0x0B3C($0)       # step_x = -1
+sw    $29, 0x093C($0)       # step_x = -1
 addi  $29, $1, 1280
 andi  $28, $29, 0x00FF      # frac_x = pos = dist to west boundary
 sub   $22, $0, $22          # $22 = abs(ray_dir_x)
 doneStepX:
+
+# Guard against exact-zero direction (cardinal angles) before dividing.
+nop
+nop
+nop
+bne   $22, $0, xDirNzOk
+addi  $22, $0, 1            # clamp abs(ray_dir_x) to a minimum of 1
+xDirNzOk:
 
 # side_dist_x = (frac_x << 8) / abs(ray_dir_x)    [FXPU: a=frac, b=dir, f=8]
 # = frac_x * 256 / dir_x = FP distance to first x-crossing
@@ -289,7 +298,7 @@ div   $26, $28, $22
 # delta_dist_x = (256 << 8) / abs(ray_dir_x) = 65536 / dir_x
 # = FP distance between consecutive x-crossings
 div   $28, $11, $22
-sw    $28, 0x0B34($0)       # store delta_dist_x
+sw    $28, 0x0934($0)       # store delta_dist_x
 
 # ---- step_y and side_dist_y ----
 # ray_dir_y > 0 = northward (y_fp increases) -> map_y_from_bottom increases -> step_map_y = +1
@@ -302,7 +311,7 @@ bne   $28, $0, yDirNeg
 
 # ray_dir_y >= 0 (northward)
 addi  $29, $0, 1
-sw    $29, 0x0B40($0)       # step_map_y = +1
+sw    $29, 0x0940($0)       # step_map_y = +1
 addi  $28, $2, 1280
 andi  $28, $28, 0x00FF      # sub-cell y position
 sub   $28, $11, $28         # frac_y = 256 - pos = dist to north cell boundary
@@ -310,17 +319,25 @@ j     doneStepY
 yDirNeg:
 # ray_dir_y < 0 (southward)
 addi  $29, $0, -1
-sw    $29, 0x0B40($0)       # step_map_y = -1
+sw    $29, 0x0940($0)       # step_map_y = -1
 addi  $29, $2, 1280
 andi  $28, $29, 0x00FF      # frac_y = pos = dist to south cell boundary
 sub   $23, $0, $23          # $23 = abs(ray_dir_y)
 doneStepY:
 
+# Guard against exact-zero direction (cardinal angles) before dividing.
+nop
+nop
+nop
+bne   $23, $0, yDirNzOk
+addi  $23, $0, 1            # clamp abs(ray_dir_y) to a minimum of 1
+yDirNzOk:
+
 # side_dist_y = (frac_y << 8) / abs(ray_dir_y)
 div   $27, $28, $23
 # delta_dist_y = 65536 / abs(ray_dir_y)
 div   $28, $11, $23
-sw    $28, 0x0B38($0)       # store delta_dist_y
+sw    $28, 0x0938($0)       # store delta_dist_y
 
 ########################################
 # DDA INNER LOOP
@@ -334,12 +351,12 @@ nop
 beq   $28, $0, ddaStepY
 
 # ---- X step ----
-lw    $28, 0x0B34($0)       # delta_dist_x
+lw    $28, 0x0934($0)       # delta_dist_x
 nop
 nop
 nop
 add   $26, $26, $28         # side_dist_x += delta_dist_x
-lw    $29, 0x0B3C($0)       # step_x
+lw    $29, 0x093C($0)       # step_x
 nop
 nop
 nop
@@ -348,12 +365,12 @@ j     ddaCheckHit
 
 ddaStepY:
 # ---- Y step ----
-lw    $28, 0x0B38($0)       # delta_dist_y
+lw    $28, 0x0938($0)       # delta_dist_y
 nop
 nop
 nop
 add   $27, $27, $28         # side_dist_y += delta_dist_y
-lw    $29, 0x0B40($0)       # step_map_y
+lw    $29, 0x0940($0)       # step_map_y
 nop
 nop
 nop
@@ -384,11 +401,6 @@ beq   $28, $0, ddaLoop      # not a wall; keep stepping
 ########################################
 # HIT: determine ray length from last side
 ########################################
-# After stepping: whichever side_dist is smaller is the side we JUST stepped into.
-# (We incremented it, so it may now be larger than the other; use the one we stepped.)
-# If we just stepped X: side_dist_x was incremented last, so we use side_dist_x.
-# If we just stepped Y: side_dist_y was incremented.
-# Detect: if side_dist_x <= side_dist_y, we stepped X (side_dist_x was the smaller before step).
 slt   $28, $27, $26         # 1 if side_dist_y < side_dist_x  -> last step was Y
 nop
 nop
@@ -397,7 +409,7 @@ bne   $28, $0, hitYSide
 
 # Hit on X side: ray_len = side_dist_x - delta_dist_x
 hitXSide:
-lw    $29, 0x0B34($0)       # delta_dist_x
+lw    $29, 0x0934($0)       # delta_dist_x
 nop
 nop
 nop
@@ -406,7 +418,7 @@ j     storeLen
 
 hitYSide:
 # Hit on Y side: ray_len = side_dist_y - delta_dist_y
-lw    $29, 0x0B38($0)       # delta_dist_y
+lw    $29, 0x0938($0)       # delta_dist_y
 nop
 nop
 nop
@@ -421,10 +433,6 @@ nop
 beq   $29, $0, noClampLen
 addi  $28, $11, 0           # clamp to 256 (= 1.0 unit min)
 noClampLen:
-
-# Store ray length
-add   $29, $15, $21
-sw    $28, 0($29)           # RAYLEN_BASE[i] = ray_len (FP 24.8)
 
 # Column height = (K << 8) / ray_len   [FXPU: a=K=32, b=ray_len, f=8]
 # = (32 * 256) / ray_len = 8192 / ray_len   (integer result)
@@ -452,7 +460,7 @@ add   $18, $18, $11
 
 # Wrap ray_angle if >= 360 deg (FP: >= 92160)
 lui   $28, 0x0001
-ori   $28, $28, 0x6800      # 92160
+ori   $28, $28, 0x6800
 slt   $29, $18, $28
 nop
 nop
@@ -469,7 +477,7 @@ nop
 bne   $19, $0, rayLoop      # loop if more rays remain
 
 # All 128 rays done; restore return address and return to main loop
-lw    $31, 0x0B44($0)       # restore raycaster's return address
+lw    $31, 0x0944($0)       # restore raycaster's return address
 nop
 nop
 nop

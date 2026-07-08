@@ -14,7 +14,7 @@ module pipeline #(parameter inputs = 256)(
     input  wire [inputs-1:0] memMappedIO,
 
     // Column heights: 128 individual 32-bit outputs tapped from DMEM
-    // CHEIGHT_BASE = 0x0934 = 2356; h[i] = DMEM[2356 + i*4] (big-endian word)
+    // CHEIGHT_BASE = 0x0734 = 1844; h[i] = DMEM[1844 + i*4] (big-endian word)
     output wire [31:0] h0,   output wire [31:0] h1,   output wire [31:0] h2,
     output wire [31:0] h3,   output wire [31:0] h4,   output wire [31:0] h5,
     output wire [31:0] h6,   output wire [31:0] h7,   output wire [31:0] h8,
@@ -65,11 +65,11 @@ module pipeline #(parameter inputs = 256)(
 
     // =====================================================================
     // DMEM column-heights tap
-    // CHEIGHT_BASE = 2356 = 0x0934. Each entry = 4 bytes, big-endian.
+    // CHEIGHT_BASE = 1844 = 0x0734. Each entry = 4 bytes, big-endian.
     // Big-endian word: mem[base], mem[base+1], mem[base+2], mem[base+3]
     // The integer height is a small positive number stored in the LSB.
     // =====================================================================
-    localparam CHEIGHT_BASE = 32'd2356;
+    localparam CHEIGHT_BASE = 32'd1844;
 
     // These are combinational reads directly from the DMEM flip-flop array.
     // The 'mem' array inside memory.v is a reg, so hierarchical references
